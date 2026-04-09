@@ -1,0 +1,812 @@
+---
+title: "Modelling Radionuclide Concentrations in Fucus on the Swedish West Coast"
+subtitle: "A Bayesian Distributed Lag Approach"
+title-block-banner: true
+affiliation-title: "Division of Particle and Nuclear Physics\nDepartment of Physics\nLund Unversity"
+author: "Pim Nelissen"
+date: 2026-01-14
+format: html
+editor: visual
+---
+
+## 1. Introduction
+
+This is the Quarto markdown document that will go through the entire data analysis process done for this project. Most code is called in from *helper* files, to ensure the document remains readable. As functions are called in from these helper files, their workings will be explained. In case you are interested in seeing the source code, refer to the helper files in the `R/` folder.
+
+We will now load these files
+
+```{r}
+source("R/data_helpers.R")
+source("R/model_helpers.R")
+source("R/plotting_helpers.R")
+```
+
+**Section 2** of this document will deal with the data wrangling process. **Section 3** will cover data exploration and visualization. **Section 4** will go through further data processing steps and creating the necessary structures for the distributed lag components. **Section 5** will give an example of how a model is specified, and **Section 6** covers results and analysis of all isotopes.
+
+For mathematical and theoretical details, refer to the project report.
+
+### Acknowledgment
+
+The work here is centered around the `mvgam` \[1\] package, an R package for Bayesian fitting of Dynamic Generalized Additive Models. Some code is adapted and modified from various sources. In case code has been adapted from somewhere, this is specified in the corresponding section of the document.
+
+\[1\] Clark N, Wells K (2023). “Dynamic Generalized Additive Models (DGAMs) for forecasting discrete ecological time series.” *Methods in Ecology and Evolution*, **14**, 771-784. [doi:10.18637/jss.v100.i05](https://doi.org/10.18637/jss.v100.i05).
+
+### Running option
+
+If below variable is TRUE, run the entire document including creating the models. Otherwise, load the models from `results/models/`.
+
+```{r}
+FULL_RUN = FALSE
+MIN_LAG = 1
+MAX_LAG = 8
+
+if (!FULL_RUN) {
+  model_files <- paste0("results/models/", list.files("results/models"))
+  lapply(model_files, load, environment())
+}
+```
+
+### Importing libraries
+
+The following packages were used in this notebook:
+
+```{r}
+# data wrangling
+library(tidyverse)
+library(glue)
+library(lubridate)
+library(readxl)
+
+# interpolation of time series
+library(zoo)
+
+# for fitting the distributed lag GAMs
+library(mgcv)
+library(mvgam)
+
+# plotting and formatting
+library(gratia)
+library(viridis)
+```
+
+## 2. Data Wrangling
+
+> **Summary**: An explanation of the pre-processing procedure, followed by import of CSVs into R dataframes compatible with the `tidy` principles.
+
+### Pre-processing
+
+The data was provided as a set of Excel `.xlsx` files with sheets for the various isotopes. The data was manually put in CSV format, which is an open standard which is suitable for later import into R. The choice was made to separate the data by type (discharge or measurement at Särdal) and isotope. For measurements, a further distinction was made between species of Fucus *spp.*. The structure of the pre-processed data is shown below:
+
+``` bash
+.
+├── discharges
+│   ├── discharges_C14.csv
+│   ├── discharges_Co60.csv
+│   ├── ...
+└── sardal
+    ├── C14
+    │   └── sardal_activity_C14_F_Various_Mattsson_2025.csv
+    ├── Co60
+    │   ├── sardal_activity_Co60_F_Serratus_Mattsson_2025.csv
+    │   └── sardal_activity_Co60_F_Vesiculosus_Mattsson_2025.csv
+    ├── Cs134
+    │   ├── ...
+    ├── ...
+    └── ...
+```
+
+### Data loading
+
+Now it's time to load the CSVs into a usable format for data-processing. The process is as follows
+
+1.  List all isotope CSV files in the Särdal path
+2.  For each CSV, map to a dataframe, setting column per species of Fucus
+3.  Find the earliest and latest observation date across all dataframes, and create a `obs_date` sequence from the earliest to latest sample date
+4.  Join together all the isotope dataframes to this unified `obs_date` column, giving one sardal dataframe `df_sardal`
+
+```{r}
+sardal_path <- "data/sardal" 
+sardal_files <- list.files(sardal_path, full.names = TRUE, pattern = "*.csv", recursive = TRUE) %>% set_names()
+sardal_df_list <- purrr::map(sardal_files, read_csv,
+                  col_types = cols(date = col_date(format = "%Y-%m-%d")))
+
+sardal_df_list <- map2(sardal_df_list, names(sardal_df_list),
+     function(.x, .y){dplyr::select(.x, 1:2) %>%
+         set_names(nm=c("obs_date", get_species_name(.y)))}) %>%
+          map(~drop_na(.x))
+
+df_sardal <- data.frame(obs_date = get_full_time_range_by_day(sardal_df_list))
+df_sardal <- map(sardal_df_list, ~ full_join(df_sardal, .x, by = "obs_date"))
+df_sardal <- reduce(df_sardal, full_join, by = "obs_date")
+
+df_long_sardal <- df_sardal %>%
+  pivot_longer(
+    cols = -obs_date,
+    names_to = "variable",
+    values_to = "value"
+  )
+```
+
+The same for steps are applied for the discharges, except we have no species and have a `year` time column instead of `obs_date`.
+
+```{r}
+discharges_path <- "data/discharges" 
+discharges_files <- list.files(discharges_path, full.names = TRUE, pattern = "*.csv", recursive = TRUE) %>% set_names()
+discharges_df_list <- purrr::map(discharges_files, read_csv)
+
+discharges_df_list <- map2(discharges_df_list, names(discharges_df_list),
+                  function(.x, .y) {
+                    isotope_name <- get_isotope_name(.y)
+                    column_names <- colnames(.x)[-1] # exclude year col.
+                    new_column_names <- c(colnames(.x)[1], paste(isotope_name, column_names, sep = "_")) # concatenate isotope name to cols.
+                    
+                    .x %>%
+                      set_names(nm = new_column_names) # update col. names
+                  }) %>%
+  map(~drop_na(.x))
+
+df_discharges <- data.frame(year = get_full_time_range_by_year(discharges_df_list))
+df_discharges <- map(discharges_df_list, ~ full_join(df_discharges, .x, by = "year"))
+df_discharges <- reduce(df_discharges, full_join, by = "year")
+
+df_long_discharges <- df_discharges %>%
+  pivot_longer(
+    cols = -year,
+    names_to = "variable",
+    values_to = "value"
+  )
+```
+
+## 3. Data exploration & visualization
+
+> **Summary**: An explanation of the data through visualization. Data quality is discussed by looking at amount of data available and missing values. Finally, an autocorrelation test is performed which shows high autocorrelation.
+
+### Plotting data
+
+```{r}
+data_Cs137 <- combine_data("Cs137", df_long_sardal, df_long_discharges)
+p <- plot_isotope(data_Cs137)
+p
+```
+
+or Co60:
+
+```{r}
+data_Co60 <- combine_data("Co60", df_long_sardal, df_long_discharges)
+p <- plot_isotope(data_Co60)
+p
+```
+
+### Number of observations
+
+For statistical analysis it is very important to know how much data one has, and how it is structured, and whether there are any missing values or irregularities. A first step could be to see how many unique daily measurements and unique yearly measurements we have:
+
+```{r}
+sum_daily <- df_sardal %>%
+  group_by(obs_date) %>%
+  summarize(across(where(is.numeric), ~ any(!is.na(.x)))) %>%
+  summarize(across(-obs_date, sum)) %>%
+  pivot_longer(everything())
+
+sum_yearly <- df_sardal %>%
+  mutate(year = year(obs_date)) %>%
+  group_by(year) %>%
+  summarize(across(where(is.numeric), ~ any(!is.na(.x)))) %>%
+  summarize(across(-year, sum)) %>%
+  pivot_longer(everything())
+
+sums_table <- merge(sum_daily, sum_yearly, by = 'name') %>%
+  rename(days = value.x, years = value.y)
+      
+sums_table
+```
+
+Here is a visualization of the above information, showing the gaps in measured activity concentration (on a yearly scale):
+
+```{r}
+df_long_sardal %>%
+  filter(!(variable %in% c("I129_F_Serratus_Winter", "I129_F_Serratus_Summer"))) %>%
+  plot_na_values()
+```
+
+### Autocorrelation
+
+Autocorrelation is a measure of correlation of a time series with a lagged (delayed) version of itself. This means it can quantify if, and how much, past values affect the present value.
+
+This is very important to be aware of
+
+```{r}
+lapply(names(df_discharges)[-1], function(col) {
+  col_data <- na.omit(df_discharges[[col]])
+  acf(col_data, plot = TRUE, main = paste("ACF Plot for", format_site_label(col)))
+})
+```
+
+```{r}
+lapply(names(df_sardal)[-1], function(col) {
+  col_data <- na.omit(df_sardal[[col]])
+  acf(col_data, plot = TRUE, main = paste("ACF Plot for", format_species_label(col)))
+})
+```
+
+We can see that there is significant autocorrelation for almost all data. A good reason for the Fucus is that radionuclides stay stored for a while, only exiting the compartment by radioactive decay or biological processes. This means we have to somehow capture this "memory" of past values in the model. One way is to add an autoregressive component
+
+$$
+y_t = \rho y_{t-1} + \dots
+$$
+
+This will be done in the model specification.
+
+### Adressing missing values in predictors
+
+Now, we will combine the discharge and activity concentration measurements for a given isotope, so that we can use that dataframe in the model.
+
+Due to limitations in the `mvgam` package, predictors **cannot** have NA values. Therefore, where missing years are present in the discharges we must address this. Let's see if we have this issue:
+
+```{r}
+plot_na_values(df_long_discharges)
+```
+
+We can see that for the caesium isotopes, there is some years without any discharge data available. We will therefore interpolate the data in these gaps in order to make fitting a model possible for caesium as well. The `interpolate_data` function will take care of this.
+
+Now, let's plot an example and see if the interpolation looks reasonable:
+
+```{r}
+vars <- df_long_discharges %>%
+  filter(str_detect(variable, "Cs137")) %>%
+  distinct(variable)
+
+# Uninterpolated data
+uninterp <- df_long_discharges %>%
+  filter(str_detect(variable, "Cs137"),
+         year > 2010) %>%
+  mutate(type = "Uninterpolated")
+
+# Interpolated ONCE using fuzzy isotope string
+interp <- interpolate_data("Cs137", df_long_discharges) %>%
+  filter(year > 2010) %>%
+  mutate(type = "Interpolated")
+
+
+# Combine
+plot_df <- bind_rows(interp, uninterp)
+
+# Plot
+ggplot(plot_df, aes(x = year, y = value, color = type)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    x = "Year",
+    y = "Discharge [TBq/y]",
+    color = "Data type"
+  ) +
+  theme_minimal()
+```
+
+Looks fine!
+
+## 4. Example modelling process: Carbon-14
+
+> **Summary**: The chapter goes through creating an isotope dataset with the hand of carbon-14. Discharge and Särdal measurements are combined into one isotope-specific dataset. Tensor smooths are introduced as the foundational component for the distributed lag model. Hierarchical structure is explained and the model is also fitted.
+
+### Combining measurements and discharge
+
+Now it is time to combine the data. The `combine_data` function will, for a given isotope string (e.g. "C14"), combine the Särdal measurement data as well as the discharge data for said isotope, returning one comprehensive dataframe.
+
+```{r}
+data_C14 <- combine_data("C14", df_long_sardal, df_long_discharges, scale_data = FALSE)
+plot_isotope(data_C14)
+```
+
+```{r}
+bomb_pulse <- read_excel("~/RadiologyProject/sardal-radioactivity-analysis/S0033822221000953sup002.xls", col_names = FALSE, skip = 314)
+
+bomb_pulse <- bomb_pulse %>%
+  mutate(year = floor(.data[[names(bomb_pulse)[1]]])) %>%
+  group_by(year) %>%
+  summarise(F14C = mean(.data[[names(bomb_pulse)[4]]], na.rm = TRUE))
+
+bomb_pulse <- bomb_pulse %>%
+  bind_rows(
+    bomb_pulse %>%
+      slice_tail(n = 2) %>%
+      mutate(slope = (F14C - lag(F14C)) / (year - lag(year))) %>%
+      slice_tail(n = 1) %>%
+      transmute(
+        year = 2020,
+        F14C = F14C + slope
+      )
+  )
+
+bomb_pulse <- bomb_pulse %>%
+  filter(year %in% data_C14$year)
+
+plot(bomb_pulse)
+data_C14$sardal <- data_C14$sardal - 0.7*bomb_pulse$F14C
+plot(data_C14$sardal)
+```
+
+One thing that may be relevant is the correlation between Sellafield and La Hague here. This is to avoid colinearity issues in the model. Basically, if the time series are highly correlated, adding them as separate predictors in a regression model can lead to inaccurate results. To do this, we must first make the series quasi-stationary by taking the first difference, before checking the correlation.
+
+```{r}
+cor(diff(data_C14$sellafield), diff(data_C14$la_hague))
+```
+
+### Lag matrix
+
+> See Wood (2017) - *Generalized Additive Models: An Introduction with R*, section 5.6 for a detailed explanation on tensor smooths.
+
+The lag matrix is is a matrix of the form
+
+```         
+0 1 2 3 4 ...
+0 1 2 3 4 ...
+0 1 2 3 4 ...
+0 1 2 3 4 ...
+...
+```
+
+with the dimensions of $N \times L$, where $N$ is the number of data points and $L$ is the maximum lag. This construction is needed in order to create a tensor smooth. A tensor product smooth is a smooth surface that is built up from several smooth basis functions. In this case, we create a smooth surface varying with discharge amount from source $x$ and the lag $l$, where the height of the surface represents the effect on $y_t^{sp}$ at a given time $t$
+
+$$
+f(x_{t-l}, l) = \sum_{k=0}^K \sum_{m=0}^M \beta_{km} b_k(x_{t-l}) c_m(l)
+$$
+
+here,
+
+-   $b_k(x_{t-l})$ are the basis functions in discharge amount $x_{t-l}$
+
+-   $c_m(l)$ are the basis functions in lag $l$
+
+and $K$ and $M$ specify the allowed complexity (number of terms) that are allowed to represent those basis functions. For more details, see Wood (2017) and the written report.
+
+```{r}
+data_C14 <- data_C14 %>%
+  add_lagged_matrices(n_max = MAX_LAG, n_min = MIN_LAG)
+```
+
+### Hierarchical structure
+
+A hierarchical model is useful when you have a dataset which consists of distinct groups that may have varying effects. Let's explain by example of our Fucus *spp.*.
+
+One could create two seperate models for Fucus *Serratus* and Fucus *Vesiculosus* respectively, modelling the effect of the discharges on each of them individually. But here we ignore the fact that there are common effects among them, namely the transport mechanisms that bring radionuclides to the Swedish coast. Instead of modelling them separately
+
+$$
+\text{Activity in F. Serratus} \sim \text{Discharge}\\
+\text{Activity in F. Vesiculosus} \sim \text{Discharge}
+$$
+
+One creates a group intercept
+
+$$
+\text{Activity} \sim (1 \vert \text{species}) + \text{Discharge}
+$$
+
+We essentially add a dummy variable to allow variable intercept / magnit
+
+measured activity concentrations, or doing something arbitrary like taking the average, a *hierarchical* modelling structure combines the information by taking both datasets in the regression, but allowing some statistical variation between them.
+
+**Example**
+
+Suppose a model which predicts temperature from $\text{CO}_2$ levels
+
+$$
+\text{Temperature} \sim \text{CO}_2
+$$
+
+Instead of fitting a model for each country, you could do something like
+
+$$
+\text{mean(Temperature)} \sim CO}_2
+$$
+
+To achieve this, we apply weight or 'mask' matrices that are the size of the lag matrices, but consist of zeroes and ones. Simply, `weights_s` matrix is 1 when the species is F. Serratus, 0 otherwise, and the same is true for the F. Vesiculosus weight matrix `weights_v`.
+
+```{r}
+data_C14 <- data_C14 %>%
+  apply_weights()
+```
+
+### Mathematical formulation
+
+With the functions defined and explained, we now specify the model:
+
+$$
+g(E[y^{\text{sp}}_t]) = \underbrace{\alpha}_{\text{intercept}} + \underbrace{\alpha^{sp}}_{\text{species effect}} + \underbrace{\rho y^{\text{sp}}_{t-1}}_{\text{AR(1)}} + \underbrace{\sum_{l=0}^L f(\text{SF}_{t-l},l)}_{\text{Sellafield contribution}}  + \underbrace{\sum_{l=0}^L f(\text{LH}_{t-l},l)}_{\text{La Hague contribution}} + \underbrace{\varepsilon_t}_{\text{error term}}
+$$
+
+where
+
+-   $\text{sp}$ represents the species of Fucus *spp.*
+
+-   $y_t^{sp}$ is the measured activity concentration in $\text{Bq / kg d.w.}$
+
+-   $l \in \{0, L\}$ is the lag in years.
+
+-   $g(\cdot)$ is the link function, that links the linear combination of predictors to the expected value of $y_t^{sp}$.
+
+-   $f(x_{t-l},l)$ is a tensor product smooth as defined before.
+
+### Fitting the model
+
+We can now fit the model. Note log-link relation between the predictors and response (for more details on why, see report).
+
+The fitting can now be done by first formulating the model in mgcv/mvgam convention, then calling the functions. Note that the family of response is now assumed to be gaussian since we took the log of the response. The line `#| include: false` simply suppresses the rather verbose logging of the model fit, in order to keep this notebook clean.
+
+#### C14 Model
+
+```{r}
+#| include: false
+
+if(FULL_RUN) {
+  formula <- sardal ~
+    te(sellafield, lag, k=4) +
+    te(la_hague, lag, k=4)
+  
+  priors <- get_mvgam_priors(
+    formula = formula,
+    family = lognormal(),
+    data = data_C14,
+    trend_model = 'AR1'
+  )
+  
+  priors$prior[3] <- 'ar1 ~ beta(2, 2);'
+  
+  model_C14_mvgam <- mvgam(formula = formula,
+                           family = lognormal(),
+                           data = data_C14,
+                           trend_model = 'AR1',
+                           burnin = 2000,
+                           samples = 4000,
+                           parallel = TRUE,
+                           threads = 6,
+                           noncentered = TRUE,
+                           priors = priors
+                           )
+  
+  save(model_C14_mvgam, file = "results/models/C14.mvgam.Rdata")
+}
+```
+
+And that's it! The `model_C14_*` are now complete fitted model objects containing estimated parameters, original data, predicted (fitted) data, STAN code, posterior information and more. We save the models for future use.
+
+## 6. All results
+
+### Carbon-14
+
+Before we fit the other models we will now look at the summary of objects created above
+
+```{r}
+summary(model_C14_mvgam)
+```
+
+```{r}
+mcmc_plot(model_C14_mvgam, variable='ar1[1]', type="areas")
+```
+
+We see that the AR(1) component is very strong, indicating a strong temporal trend. This is the residual of the carbon-14 bomb pulse that is being captured by the AR(1) trend component. The tensor product smooth posteriors are a bit difficult to interpret directly. Instead, we can look at the final estimated interaction effect surface from the fitted tensor product smooths:
+
+```{r}
+plot_mvgam_smooth(model_C14_mvgam, series = 1, smooth = 1)
+plot_mvgam_smooth(model_C14_mvgam, series = 1, smooth = 2)
+```
+
+Again, these surfaces represent $f(x_{t-l}, l)$, essentially the 'joint effect' of lag and discharge on the measured activity concentration in Fucus at Särdal. Sellafield is showing a pattern in line with expectations: a higher discharge from Sellafield results in a higher (more positive) effect on Särdal activity concentrations. Regarding lag, we see that the highest values are centered around 3-5 years, with a very broad delayed effect up to 8 years as well, with the effect becoming closer to 0 near 9-10 years. This seems in line with estimates of Sellafield transport time being approximately 3-4 years, corresponding to the initial 'hit', and the prolonged effect across many lags could be due to the delayed uptake as other environmental processes (which? ask Kristina). La Hague does not really match expectation.
+
+We can also inspect what the predictions are from this fitted model (note the log scale!):
+
+```{r}
+plot(hindcast(model_C14_mvgam))
+```
+
+Some model diagnostics that will inform us about the fit are the residual plots and the prior-posterior check:
+
+```{r}
+plot_mvgam_resids(model_C14_mvgam)
+ppc(model_C14_mvgam)
+```
+
+The residual plots, such as the Q-Q plot, indicate a good model fit, suggesting that the log-link function is appropriately describing the relation between the predictors and response. There is some slight residual autocorrelation which is not captured by the AR(1) process, overall the AR(1) has proved very effective at capturing both the effect of the bomb pulse and the 'memory' effect of radiocarbon being stored in the Fucus over several years.
+
+The posterior predictive check (PPC) shows how well the estimated posterior $\hat{y}$ prepresents the distribution of the observed data $y$. We can see a rather good fit, indicating that $y$ is normally distributed under log-link relation with the predictors, with all observed data falling within approximately $2\sigma$ of the mean of the posterior distribution.
+
+### Caesium-137
+
+Now, caesium is a unique case, because the influence from the 1986 Chernobyl accident on Ceasium concentrations in the Nordics has been well studied. In particular, outflow from the Baltic sea is predicted to be the primary contributor of ceasium activity concentrations on the Swedish west coast. Thus, we must include it. We include here a Baltic sea caesium-137 simulation based on information from HELCOM (2009) *Radioactivity in the Baltic Sea, 1999-2006 HELCOM thematic assessment.* Balt. Sea Environ. Proc. No. 117, pages 21 and 22.
+
+```{r}
+simulate_baltic_cs137 <- function(data_Cs137) {
+  
+  # take a vector of years from the original dataset
+  years <- sort(unique(data_Cs137$year))
+  total_years <- length(years)
+  # number of data points after the incident
+  n_after <- length(years[years >= 1986])
+
+  t <- seq_len(n_after) - 1
+
+  # effective half lives used from HELCOM 2009 pp. 21-22
+  k_1 <- log(2)/2.5 # 1986-1988
+  k_2 <- log(2)/9 # 1990 - end
+  y_0 <- 650 # approximate peak value Bq / m^-3
+  
+  # prefill empty array
+  x <- array(5, total_years)
+  
+  # expoenential decay with piecewise half lives
+  data <- y_0 * exp(- (k_1 * pmin(t, 3) + k_2 * pmax(0, t - 3)))
+  
+  # replace the tail (from 1986 to end) by sim data
+  x[(total_years - n_after + 1):total_years] <- data
+    
+  # add noise
+  set.seed(123)
+  x <- x + rnorm(total_years, sd = 0.1 * mean(x))
+  return(as.vector(x))
+}
+```
+
+Adding baltic sea simulation to the data:
+
+```{r}
+data_Cs137 <- combine_data("Cs137", df_long_sardal, df_long_discharges, scale_data = FALSE)
+
+baltic_Cs137 <- simulate_baltic_cs137(data_Cs137)
+
+data_Cs137 <- data_Cs137 %>%
+  group_by(series) %>%
+  mutate(baltic = baltic_Cs137) %>%
+  ungroup()
+
+plot_isotope(data_Cs137)
+```
+
+Let's check correlation once more
+
+```{r}
+cor(diff(data_Cs137$sellafield), diff(data_Cs137$baltic))
+```
+
+We prepare the data as before
+
+```{r}
+data_Cs137 <- data_Cs137 %>%
+  add_lagged_matrices(n_max = MAX_LAG, n_min = MIN_LAG) %>%
+  apply_weights()
+```
+
+Note the extra terms below in the formula. It looks like we have a much bigger model, but this is the hierarchical model at play through applying the terms only when the weights matrix contains a 1. Anyways, let's fit
+
+#### Model
+
+```{r}
+#| include: false
+
+if(FULL_RUN) {
+  formula <- sardal ~
+    te(sellafield, lag,
+       k = 4) +
+    te(baltic, lag,
+       k = 4)
+  
+  model_Cs137_mvgam <- mvgam(formula = formula,
+                           family = lognormal(),
+                           data = data_Cs137,
+                           burnin = 2000,
+                           samples = 4000,
+                           parallel = TRUE,
+                           threads = 6
+                           )
+
+  save(model_Cs137_mvgam, file = "results/models/Cs137.mvgam.Rdata")
+}
+```
+
+We can make the same plots and summaries as before:
+
+```{r}
+summary(model_Cs137_mvgam)
+mcmc_plot(model_Cs137_mvgam)
+```
+
+There appears to be no significant contribution from La Hague, but, the model finds predictive power for both Sellafield discharges and Baltic sea activity concentrations.
+
+Unlike for Carbon-14 we have separate time series available for both Fucus Serratus and Fucus Vesiculosus, so we also have two different possible responses.
+
+```{r}
+plot_mvgam_smooth(model_Cs137_mvgam, smooth = 1)
+plot_mvgam_smooth(model_Cs137_mvgam, smooth = 2)
+```
+
+In both species we see a reasonable pattern for Baltic outflow, with increasing concentrations in the Baltic sea predicting higher activity concentrations in the Fucus. The effect seems to be mainly around 1-2 years delay with a long tail of influence towards higher lags. The hypothesis that the majority of Caesium-137 after 1986 originates from Baltic sea outflow into the Kattegat has been described and supported in Mattsson et al. (2025) by effective half life calculations. Our simulated series of activity concentrations based on reported effective half lives seems to corroborate this hypothesis.
+
+That Sellafield has predictive power in the model, could indicate that the peak in activity concentrations around the 1980s before the Chernobyl disaster is caused by the significant discharges from Sellafield in the late 1970s. However, the smooth does not seem to be quite the expected shape.
+
+```{r}
+plot(hindcast(model_Cs137_mvgam))
+plot(hindcast(model_Cs137_mvgam), series = 2)
+```
+
+The trends look slightly different. We can see what the difference is:
+
+```{r}
+plot(model_Cs137_mvgam, type = "re")
+```
+
+It seems like the uncertainties are rather large and we cannot say anything conclusive from this model whether F. Serratus and F. Vesiculosus have different uptake of Caesium-137 in the Swedish west coast marine environment.
+
+And the diagnostics:
+
+```{r}
+plot_mvgam_resids(model_Cs137_mvgam)
+ppc(model_Cs137_mvgam)
+```
+
+### Cobalt-60
+
+```{r}
+data_Co60 <- combine_data("Co60", df_long_sardal, df_long_discharges, scale_data = FALSE)
+plot_isotope(data_Co60)
+```
+
+```{r}
+cor(diff(data_Co60$barseback), diff(data_Co60$la_hague))
+cor(diff(data_Co60$barseback), diff(data_Co60$winfrith))
+cor(diff(data_Co60$winfrith), diff(data_Co60$la_hague))
+```
+
+Now, for Cobalt-60 we have rather limited data available, and in order to get a useful model, one cannot have too many parameters compared to number of datapoints. Thus, since the signal for Sellafield is rather weak compared to the rest we ignore it. We prepare the data as before
+
+```{r}
+data_Co60 <- data_Co60 %>%
+  add_lagged_matrices(n_max = MAX_LAG, n_min = MIN_LAG) %>%
+  apply_weights()
+```
+
+Let's fit as before
+
+#### Model
+
+```{r}
+#| include: false
+
+if(FULL_RUN) {
+  formula <- sardal ~
+    te(la_hague, lag,
+       k = 4) +
+    te(barseback, lag,
+       k = 4)
+
+  model_Co60_mvgam <- mvgam(formula = formula,
+                           family = lognormal(),
+                           trend_model = 'None',
+                           data = data_Co60,
+                           burnin = 2000,
+                           samples = 4000,
+                           parallel = TRUE,
+                           threads = 6
+                           )
+
+  save(model_Co60_mvgam, file = "results/models/Co60.mvgam.Rdata")
+}
+```
+
+We can make the same plots and summaries as before:
+
+```{r}
+summary(model_Co60_mvgam)
+mcmc_plot(model_Co60_mvgam)
+```
+
+```{r}
+plot_mvgam_smooth(model_Co60_mvgam, smooth = 1)
+plot_mvgam_smooth(model_Co60_mvgam, smooth = 2)
+```
+
+```{r}
+plot(hindcast(model_Co60_mvgam), series = 1)
+plot(hindcast(model_Co60_mvgam), series = 2)
+```
+
+```{r}
+plot(model_Co60_mvgam, type = "re")
+```
+
+And the diagnostics:
+
+```{r}
+plot_mvgam_resids(model_Co60_mvgam)
+ppc(model_Co60_mvgam)
+```
+
+### Iodine-129
+
+For Iodine-129, Mattsson et al. (2025) report significant seasonal differences between summer and winter data, up to 3 times higher concentrations in summer. Because this is a signifcant effect, and we have the collection season available as data, we chose here to treat F. Serratus in summer and winter as two separate 'species'. We drop the mean measurement which is denoted as just F. Serratus:
+
+```{r}
+data_I129 <- combine_data("I129", df_long_sardal, df_long_discharges, scale_data = FALSE)
+
+plot_isotope(data_I129)
+
+data_I129 <- droplevels(data_I129[!data_I129$series == 'I129_F_Serratus',])
+
+data_I129 <- data_I129 %>%
+  add_lagged_matrices(n_max = MAX_LAG, n_min = MIN_LAG) %>%
+  apply_weights()
+```
+
+```{r}
+cor(diff(data_I129$sellafield), diff(data_I129$la_hague))
+```
+
+#### Model
+
+Let's fit as before
+
+```{r}
+#| include: false
+
+if(FULL_RUN) {
+  formula <- sardal ~
+    s(series, bs = "re") +
+    te(sellafield, lag, k = 4, by=weights_ss) +
+    te(sellafield, lag, k = 4, by=weights_sw) +
+    te(la_hague, lag, k = 4, by=weights_ss) +
+    te(la_hague, lag, k = 4, by=weights_sw)
+  
+  model_I129_mvgam <- mvgam(formula = formula,
+                            family = lognormal(),
+                            data = data_I129,
+                            trend_model = AR(1),
+                            burnin = 2000,
+                           samples = 4000,
+                           parallel = TRUE,
+                           threads = 6
+                             )
+
+  save(model_I129_mvgam, file = "results/models/I129.mvgam.Rdata")
+}
+```
+
+We can make the same plots and summaries as before:
+
+```{r}
+summary(model_I129_mvgam)
+mcmc_plot(model_I129_mvgam)
+```
+
+```{r}
+plot_mvgam_smooth(model_I129_mvgam, smooth = 1)
+plot_mvgam_smooth(model_I129_mvgam, smooth = 2)
+plot_mvgam_smooth(model_I129_mvgam, smooth = 3)
+plot_mvgam_smooth(model_I129_mvgam, smooth = 4)
+```
+
+```{r}
+plot(hindcast(model_I129_mvgam), series = 1)
+plot(hindcast(model_I129_mvgam), series = 2)
+```
+
+```{r}
+plot_mvgam_randomeffects(model_I129_mvgam)
+```
+
+And the diagnostics:
+
+```{r}
+plot_mvgam_resids(model_I129_mvgam)
+ppc(model_I129_mvgam)
+```
+
+## Generative AI statement
+
+Generative AI (GAI) was **not** **used** for text generation anywhere in this document or the final report.
+
+GAI (Mistral 3, GPT-4, GPT-5) **has been used** for debugging and for creating and modifying visualization code (e.g. code for plot titles, labels, fonts, colour schemes).
+
+GAI was **not** **used** for "mission-critical" code, such as the loading/wrangling of data and the specification of the model.
+
+GAI was **not** **used** for generation or interpretation of the results.
+
+All output from GAI that has been used was reviewed and edited to ensure that any output used in the final document was correct and achieved its intended purpose. The author takes full responsibility for the contents of this document.
