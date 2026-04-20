@@ -177,7 +177,7 @@ add_lagged_matrices <- function(data, n_max = 6, n_min = 0) {
   n_lag <- n_max - n_min
   
   # identify predictor columns to lag
-  ignore_set <- c("time", "year", "sardal", "series")
+  ignore_set <- c("time", "year", "sardal", "series", "bomb_pulse")
   preds_to_lag <- setdiff(names(data), ignore_set)
   
   # function to create lag number matrices
@@ -230,6 +230,10 @@ add_lagged_matrices <- function(data, n_max = 6, n_min = 0) {
     ),
     lagged_preds
   )
+  
+  if ("bomb_pulse" %in% names(data_trim)) {
+    data_all$bomb_pulse <- data_trim$bomb_pulse
+  }
   
   return(data_all)
 }
